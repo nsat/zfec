@@ -29,12 +29,15 @@ extra_compile_args.append("-std=c99")
 define_macros=[]
 undef_macros=[]
 
-for arg in sys.argv:
+for arg in sys.argv[:]:
     if arg.startswith("--stride="):
         stride = int(arg[len("--stride="):])
         define_macros.append(('STRIDE', stride))
         sys.argv.remove(arg)
-        break
+    elif arg == "--with-arm-neon":
+        extra_compile_args.append("-mfpu=neon")
+        define_macros.append(('ZFEC_USE_ARM_NEON', None))
+        sys.argv.remove(arg)
 
 if DEBUGMODE:
     extra_compile_args.append("-O0")

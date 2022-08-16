@@ -6,6 +6,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <string.h>
 #include <assert.h>
 
@@ -64,6 +65,9 @@ static gf gf_mul_table[256][256];
 #define GF_MULC0(c) __gf_mulc_ = gf_mul_table[c]
 #define GF_ADDMULC(dst, x) dst ^= __gf_mulc_[x]
 
+/* gf_mul_table_16[c][x] = gf_mul_table[c][x << 4] */
+static gf gf_mul_table_16[256][16];
+
 /*
  * Generate GF(2**m) from the irreducible polynomial p(X) in p[0]..p[m]
  * Lookup tables:
@@ -83,6 +87,10 @@ _init_mul_table(void) {
 
   for (j = 0; j < 256; j++)
       gf_mul_table[0][j] = gf_mul_table[j][0] = 0;
+
+  for (i = 0; i < 256; i++)
+      for (j = 0; j < 16; j++)
+          gf_mul_table_16[i][j] = gf_mul_table[i][j << 4];
 }
 
 #define NEW_GF_MATRIX(rows, cols) \
@@ -174,6 +182,56 @@ _addmul1(register gf*restrict dst, const register gf*restrict src, gf c, size_t 
 
     GF_MULC0 (c);
 
+#if defined(ZFEC_USE_ARM_NEON) && UNROLL == 16
+    // Idea from https://botan.randombit.net zfec_vperm.cpp
+    
+    const gf * const gf_mulc_16 = gf_mul_table_16[c];
+    
+    /* align dst to 16 bytes */
+    while(sz && (uintptr_t)dst % 16) {
+        GF_ADDMULC (*dst, *src);
+        dst++;
+        src++;
+        sz--;
+    }
+    /* 
+     * for (; dst < lim; dst += 16, src += 16) {
+     *   // 16x parallel
+     *   for (int i = 0; i < 16; i++) {
+     *     dst[i] ^= __gf_mulc_[src[i] & 0x0f] ^ gf_mulc_16[src[i] >> 4];
+     *   }
+     * }
+     * dst should be aligned to 16 bytes
+     */
+    __asm__(
+        "vmov.i8  q0, #0x0f              \n\t"  // q0 = 0x0f0f...0f
+        "vld1.8   {q3}, [%[gf_mulc]]     \n\t"  // q3 = gf_mulc[0..15]
+        "vld1.8   {q8}, [%[gf_mulc_16]]  \n\t"  // q8 = gf_mulc_16[0..15]
+    "1:                                  \n\t"  //
+        "cmp      %[dst], %[lim]         \n\t"  //
+        "bhs      2f                     \n\t"  // while (dst < lim) {
+        "vld1.8   {q2}, [%[src]]!        \n\t"  //   q2 = src[0..15];  src += 16
+        "vld1.8   {q1}, [%[dst]:128]     \n\t"  //   q1 = dst[0..15]
+        "vand.8   q9, q2, q0             \n\t"  //   q9 = src & 0x0f0f...0f
+        "vtbl.8   d18, {q3}, d18         \n\t"  //
+        "vshr.u8  q10, q2, #4            \n\t"  //   q10 = src >> 4
+        "vtbl.8   d19, {q3}, d19         \n\t"  //   q9 = gf_mulc[q9]
+        "vtbl.8   d20, {q8}, d20         \n\t"  //
+        "vtbl.8   d21, {q8}, d21         \n\t"  //   q10 = gf_mulc_16[q10]
+        "veorq.8  q1, q9                 \n\t"  //
+        "veorq.8  q1, q10                \n\t"  //
+        "vst1.8   {q1}, [%[dst]:128]!    \n\t"  //   dst[0..15] ^= q9 ^ q10;  dst += 16
+        "b        1b                     \n\t"  //
+    "2:                                  \n\t"  // }
+        : [dst]"+r"(dst),
+          [src]"+r"(src)
+        : [lim]       "r"(lim),
+          [gf_mulc]   "r"(__gf_mulc_),
+          [gf_mulc_16]"r"(gf_mulc_16)
+        : "q0", "q1", "q2", "q3", "q8", "q9", "q10", "memory", "cc"
+    );
+
+#else
 #if (UNROLL > 1)                /* unrolling by 8/16 is quite effective on the pentium */
     for (; dst < lim; dst += UNROLL, src += UNROLL) {
         GF_ADDMULC (dst[0], src[0]);
@@ -198,9 +256,102 @@ _addmul1(register gf*restrict dst, const register gf*restrict src, gf c, size_t 
 #endif
     }
 #endif
+#endif
+
     lim += UNROLL - 1;
     for (; dst < lim; dst++, src++)       /* final components */
         GF_ADDMULC (*dst, *src);
+}
+
+/*
+ * dst[] = dst[] + c1*src1[] + c2*src2[]
+ */
+static void
+addmul2(register gf*restrict dst,
+        const register gf*restrict src1,
+        const register gf*restrict src2,
+        gf c1,
+        gf c2,
+        size_t sz) {
+#if !defined(ZFEC_USE_ARM_NEON)
+    _addmul1(dst, src1, c1, sz);
+    _addmul1(dst, src2, c2, sz);
+#else
+    const gf* lim = &dst[sz - 16 + 1];
+
+    const gf * const gf_mulc1 = gf_mul_table[c1];
+    const gf * const gf_mulc2 = gf_mul_table[c2];
+    const gf * const gf_mulc1_16 = gf_mul_table_16[c1];
+    const gf * const gf_mulc2_16 = gf_mul_table_16[c2];
+    
+    /* align dst to 16 bytes */
+    while(sz && (uintptr_t)dst % 16) {
+        *dst ^= gf_mulc1[*src1] ^ gf_mulc2[*src2];
+        src1++;
+        src2++;
+        dst++;
+        sz--;
+    }
+    /* 
+     * for (; dst < lim; dst += 16, src1 += 16, src2 += 16) {
+     *   // 16x parallel
+     *   for (int i = 0; i < 16; i++) {
+     *     dst[i] ^= gf_mulc1[src1[i] & 0x0f] ^ gf_mulc1_16[src1[i] >> 4];
+     *     dst[i] ^= gf_mulc2[src2[i] & 0x0f] ^ gf_mulc2_16[src2[i] >> 4];
+     *   }
+     * }
+     * dst should be aligned to 16 bytes
+     */
+    __asm__(
+        "vmov.i8  q0, #0x0f               \n\t"
+        "vld1.8   {q1}, [%[gf_mulc1]]     \n\t"
+        "vld1.8   {q2}, [%[gf_mulc2]]     \n\t"
+        "vld1.8   {q3}, [%[gf_mulc1_16]]  \n\t"
+        "vld1.8   {q8}, [%[gf_mulc2_16]]  \n\t"
+    "1:                                   \n\t"
+        "cmp      %[dst], %[lim]                                    \n\t"
+        "bhs      2f                                                \n\t"
+        /* scheduling could be improved... */
+        /*       c1*src1                        c2*src2                */
+        "vld1.8   {q9}, [%[src1]]!                                  \n\t"
+                                       "vld1.8   {q10}, [%[src2]]!  \n\t"
+        "vand.8   q12, q9, q0                                       \n\t"
+        "vld1.8   {q11}, [%[dst]:128]                               \n\t"
+        "vshr.u8  q13, q9, #4                                       \n\t"
+        "vtbl.8   d24, {q1}, d24                                    \n\t"
+                                       "vand.8   q14, q10, q0       \n\t"
+        "vtbl.8   d25, {q1}, d25                                    \n\t"
+                                       "vshr.u8  q15, q10, #4       \n\t"
+        "vtbl.8   d26, {q3}, d26                                    \n\t"
+        "vtbl.8   d27, {q3}, d27                                    \n\t"
+        "veorq.8  q11, q12                                          \n\t"
+                                       "vtbl.8   d28, {q2}, d28     \n\t"
+                                       "vtbl.8   d29, {q2}, d29     \n\t"
+                                       "vtbl.8   d30, {q8}, d30     \n\t"
+        "veorq.8  q11, q13                                          \n\t"
+                                       "vtbl.8   d31, {q8}, d31     \n\t"
+                                       "veorq.8  q11, q14           \n\t"
+                                       "veorq.8  q11, q15           \n\t"
+        "vst1.8   {q11}, [%[dst]:128]!                              \n\t"
+        "b        1b                                                \n\t"
+    "2:                                                             \n\t"
+        : [dst] "+r"(dst),
+          [src1]"+r"(src1),
+          [src2]"+r"(src2)
+        : [lim]        "r"(lim),
+          [gf_mulc1]   "r"(gf_mulc1),
+          [gf_mulc2]   "r"(gf_mulc2),
+          [gf_mulc1_16]"r"(gf_mulc1_16),
+          [gf_mulc2_16]"r"(gf_mulc2_16)
+        : "q0", "q1", "q2", "q3", "q8", "q9", "q10", "q11",
+          "q12", "q13", "q14", "q15", "memory", "cc"
+    );
+
+    lim += 16 - 1;
+    for (; dst < lim; dst++, src1++, src2++) {      /* final components */
+        *dst ^= gf_mulc1[*src1] ^ gf_mulc2[*src2];
+    }
+#endif
 }
 
 /*
@@ -476,8 +627,12 @@ fec_encode(const fec_t* code, const gf*restrict const*restrict const src, gf*res
             assert (fecnum >= code->k);
             memset(fecs[i]+k, 0, stride);
             p = &(code->enc_matrix[fecnum * code->k]);
-            for (j = 0; j < code->k; j++)
+            for (j = 0; j < (code->k & ~1); j += 2) {
+                addmul2(fecs[i]+k, src[j]+k, src[j+1]+k, p[j], p[j+1], stride);
+            }
+            for (; j < code->k; j++) {
                 addmul(fecs[i]+k, src[j]+k, p[j], stride);
+            }
         }
     }
 }
