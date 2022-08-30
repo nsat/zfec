@@ -1,4 +1,4 @@
-
+This branch was created for the zfec update captured in the initial PR 21027.
 
 zfec -- efficient, portable erasure coding tool
 ===============================================
